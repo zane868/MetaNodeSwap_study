@@ -18,21 +18,17 @@ const config: HardhatUserConfig = {
     hardhat: {
     },
     sepolia: {
-      url: "",
-      accounts: [], // 本地测试无需配置 Sepolia 私钥
+      url: process.env.SEPOLIA_RPC_URL || "",
+      accounts: process.env.SEPOLIA_PRIVATE_KEY
+        ? [process.env.SEPOLIA_PRIVATE_KEY]
+        : [],
     },
   },
   etherscan: {
     apiKey: {
-      sepolia: "",
+      sepolia: process.env.ETHERSCAN_API_KEY || "",
     },
   },
 };
 
-module.exports = {
-  default: config,
-  gasReporter: {
-    enable : true,
-    currency: '$'
-  }
-}
+export default config;

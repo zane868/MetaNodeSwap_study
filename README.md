@@ -491,3 +491,13 @@ interface ISwapCallback {
     ) external;
 }
 ```
+# HTML 交互页面
+
+已接入本仓库部署的 Sepolia 合约，支持钱包连接、兑换、创建池子和流动性仓位管理。
+
+```sh
+python3 -m http.server 8080 --directory web
+```
+
+打开 http://localhost:8080，详细操作见 [前端说明](web/README.md)。
+
