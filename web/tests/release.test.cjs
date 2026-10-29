@@ -16,16 +16,18 @@ class Element {
   setCustomValidity(message){this.validationMessage=message;}
   focus(){}
 }
-async function app(storage=new Map()){
+async function app(storage=new Map(),search=''){
   const elements=new Map();
   const get=id=>{if(!elements.has(id))elements.set(id,new Element());return elements.get(id);};
-  const context=vm.createContext({console,ethers,
+  const context=vm.createContext({console,ethers,URL,URLSearchParams,
     document:{getElementById:get,querySelectorAll:()=>[],createElement:()=>new Element()},
-    history:{replaceState(_a,_b,url){context.hash=url;}},location:{hash:''},
+    history:{replaceState(_a,_b,url){context.hash=url;}},location:{hash:'',search,href:'http://localhost:8080/'+search,assign(url){context.redirect=url;}},
     window:{addEventListener(){},ethereum:{on(){},async request({method}){if(method==='eth_chainId')return '0xaa36a7';if(method==='eth_accounts')return ['0x1111111111111111111111111111111111111111'];throw Error('Unexpected wallet call');}}},
     localStorage:{getItem:k=>storage.get(k)||null,setItem:(k,v)=>storage.set(k,v)},
     Option:class{constructor(text,value){this.text=text;this.value=value;}},
     fetch:async file=>({ok:true,json:async()=>JSON.parse(fs.readFileSync(path.join(root,file),'utf8'))})});
+  vm.runInContext(fs.readFileSync(path.join(root,'deployments.js'),'utf8'),context);
+  vm.runInContext(fs.readFileSync(path.join(root,'liquidity-math.js'),'utf8'),context);
   vm.runInContext(fs.readFileSync(path.join(root,'app.js'),'utf8'),context);
   await vm.runInContext('tokenReady',context);
   return {context,get,storage,exec:code=>vm.runInContext(code,context)};
@@ -134,4 +136,209 @@ test('existing pool range uses token decimals and on-chain current price as the 
   const card=a.exec('renderPoolPriceRange(pools[0])');
   assert.match(card.children[0].textContent,/WETH \/ USDC/);
   assert.match(card.children[1].children[0].children[2].textContent,/相对当前价 ≈ −75.00%/);
+});
+
+test('nested wallet errors reveal the RPC cause and decode missing allowances',async()=>{
+  const a=await app();
+  a.context.rpcError={code:'UNKNOWN_ERROR',shortMessage:'could not coalesce error',error:{code:-32000,message:'in-flight transaction limit reached for delegated accounts'}};
+  assert.match(a.exec('formatWalletError(rpcError)'),/待确认交易/);
+  const iface=new ethers.Interface(['error ERC20InsufficientAllowance(address spender,uint256 allowance,uint256 needed)']);
+  a.context.rpcError={code:'UNKNOWN_ERROR',shortMessage:'could not coalesce error',info:{error:{data:{originalError:{data:iface.encodeErrorResult('ERC20InsufficientAllowance',['0x8201A0bB36E7c705431e4B859A12462a40ac6b8F',0n,10n**18n])}}}}};
+  assert.match(a.exec('formatWalletError(rpcError)'),/授权额度不足/);
+  a.exec('fail(rpcError)');assert.equal(a.get('errorDetails').hidden,false);
+  assert.match(a.get('errorDetailsText').textContent,/1000000000000000000/);
+});
+
+test('liquidity waits for and verifies both approvals before mint simulation and sending',async()=>{
+  const a=await app(),calls=[],allowances=new Map();
+  const addresses=['0x2222222222222222222222222222222222222222','0x3333333333333333333333333333333333333333'];
+  const amounts=[10000n*10n**18n,10n**18n];
+  a.context.ethers={...ethers,Contract:class{
+    constructor(address){this.address=address;}
+    async balanceOf(){calls.push('balance:'+this.address);return 100000n*10n**18n;}
+    async allowance(_account,_spender,overrides){calls.push((overrides?'verify:':'allowance:')+this.address);if(overrides)assert.equal(overrides.blockTag,42);return allowances.get(this.address)||0n;}
+    async approve(_spender,value){const address=this.address;calls.push('approve:'+address);return{hash:'0x'+'11'.repeat(32),async wait(){calls.push('confirmed:'+address);allowances.set(address,value);return{status:1,blockNumber:42}}};}
+  }};
+  const mint=async params=>{calls.push('mint');assert.equal(params.amount0Desired,amounts[0]);assert.equal(params.amount1Desired,amounts[1]);return{hash:'0x'+'22'.repeat(32),async wait(){return{status:1,blockNumber:43}}};};
+  mint.staticCall=async()=>{calls.push('simulate');for(let i=0;i<2;i++)assert.equal(allowances.get(addresses[i]),amounts[i]);return{liquidity:1n};};
+  a.context.fakeMint=mint;
+  a.exec(`account='0x1111111111111111111111111111111111111111';signer={};provider={};pools=[{token0:'${addresses[0]}',token1:'${addresses[1]}',index:0n,m0:{address:'${addresses[0]}',symbol:'M_USDT',decimals:18},m1:{address:'${addresses[1]}',symbol:'M_ETH',decimals:18}}];contracts={PositionManager:{mint:fakeMint}};refresh=async()=>{}`);
+  a.get('lpPool').value='0';a.get('lpAmount0').value='10000';a.get('lpAmount1').value='1';
+  await a.exec('addLiquidity()');
+  assert.deepEqual(calls.slice(0,2),addresses.map(v=>'balance:'+v));
+  for(const address of addresses)assert.ok(calls.indexOf('verify:'+address)<calls.indexOf('simulate'));
+  assert.equal(calls.at(-1),'mint');
+});
+
+test('a confirmed approval that is still insufficient stops before adding liquidity',async()=>{
+  const a=await app();let sends=0;
+  a.context.ethers={...ethers,Contract:class{
+    async allowance(){return 0n;}
+    async approve(){sends++;return{hash:'0x'+'11'.repeat(32),async wait(){return{status:1,blockNumber:42}}};}
+  }};
+  a.exec("account='0x1111111111111111111111111111111111111111';signer={}");
+  await assert.rejects(a.exec("approve({address:'0x2222222222222222222222222222222222222222',symbol:'M_ETH'},ADDR.PositionManager,1n)"),/额度仍不足/);
+  assert.equal(sends,1);
+});
+
+test('RPC gas-price cooldown with code -32002 is not mislabeled as a pending wallet prompt',async()=>{
+  const a=await app();
+  a.context.rpcError={code:'UNKNOWN_ERROR',shortMessage:'could not coalesce error',error:{code:-32002,message:'RPC 0x7a69 Custom eth_gasPrice: RPC endpoint returned too many errors, retrying in 0.43 minutes. Consider using a different RPC endpoint.'}};
+  const message=a.exec('formatWalletError(rpcError)');
+  assert.match(message,/RPC 暂时不可用/);assert.match(message,/11155111/);assert.match(message,/31337/);
+  assert.doesNotMatch(message,/待处理请求/);
+  a.context.rpcError={code:'UNKNOWN_ERROR',error:{code:-32002,message:'Request of type eth_requestAccounts already pending'}};
+  assert.match(a.exec('formatWalletError(rpcError)'),/待处理请求/);
+});
+
+test('liquidity preview explains the 1000 USDT / 2 ETH mismatch and fills the matching amount',async()=>{
+  const a=await app();
+  a.exec("pools=[{token0:'0x2222222222222222222222222222222222222222',token1:'0x3333333333333333333333333333333333333333',tickLower:-52986,tickUpper:-46054,sqrtPriceX96:7911230275093791286156619990n,liquidity:137250872007063784060n,wallet0:20000n*10n**18n,wallet1:10n*10n**18n,m0:{symbol:'M_USDT',decimals:18},m1:{symbol:'M_ETH',decimals:18}}]");
+  a.get('lpPool').value='0';a.get('lpAmount0').value='1000';a.get('lpAmount1').value='2';
+  a.exec('renderLiquidityPreview()');
+  const rows=a.get('lpPreview').children[1].children[1].children;
+  assert.match(rows[0].children[2].textContent,/1\.00516893/);
+  assert.match(rows[0].children[3].textContent,/998\.99483106/);
+  assert.equal(rows[1].children[2].textContent,'2');
+  a.exec('fillLpMatch(1)');
+  assert.equal(a.get('lpAmount0').value,'1.005168935060106706');
+  a.get('lpAmount1').value='11';a.exec('renderLiquidityPreview()');
+  assert.match(a.get('lpAmount1').validationMessage,/超过钱包余额/);
+});
+
+test('preview math matches SDK tick and liquidity integer rounding',()=>{
+  const math=require('../liquidity-math.js');
+  const {TickMath,maxLiquidityForAmounts,SqrtPriceMath}=require('../../swap-contract/node_modules/@uniswap/v3-sdk');
+  const JSBI=require('../../swap-contract/node_modules/jsbi');
+  for(const tick of [-887272,-52986,-46054,-1,0,1,887272])assert.equal(math.sqrtAtTick(tick).toString(),TickMath.getSqrtRatioAtTick(tick).toString());
+  const p={tickLower:-52986,tickUpper:-46054,sqrtPriceX96:7911230275093791286156619990n,liquidity:137250872007063784060n};
+  const x=JSBI.BigInt(p.sqrtPriceX96.toString()),lo=TickMath.getSqrtRatioAtTick(p.tickLower),hi=TickMath.getSqrtRatioAtTick(p.tickUpper);
+  for(const [a,b] of [[1000n*10n**18n,2n*10n**18n],[1n*10n**18n,10n*10n**18n],[0n,0n]]){
+    const q=math.quote(p,a,b),l=maxLiquidityForAmounts(x,lo,hi,JSBI.BigInt(a.toString()),JSBI.BigInt(b.toString()),false);
+    assert.equal(q.liquidity.toString(),l.toString());
+    assert.equal(q.amount0.toString(),SqrtPriceMath.getAmount0Delta(x,hi,l,true).toString());
+    assert.equal(q.amount1.toString(),SqrtPriceMath.getAmount1Delta(lo,x,l,true).toString());
+    assert.ok(q.amount0<=a&&q.amount1<=b);
+  }
+});
+
+test('each position recovers actual deposited amounts from its own Mint event, not pool totals or input caps',async()=>{
+  const a=await app(),pm=a.exec('ADDR.PositionManager'),wallet='0x1111111111111111111111111111111111111111';
+  const pool={pool:'0x4444444444444444444444444444444444444444',token0:'0x2222222222222222222222222222222222222222',token1:'0x3333333333333333333333333333333333333333'};
+  const position={id:2n,token0:pool.token0,token1:pool.token1,index:0n,liquidity:42n,tokensOwed0:0n,tokensOwed1:0n};
+  const iface=new ethers.Interface(JSON.parse(fs.readFileSync(path.join(root,'abi/PositionManager.json'))));
+  const events=new ethers.Interface(['event Mint(address sender,address indexed owner,uint128 amount,uint256 amount0,uint256 amount1)']);
+  const params={token0:pool.token0,token1:pool.token1,index:0,amount0Desired:1000n*10n**18n,amount1Desired:2n*10n**18n,recipient:wallet,deadline:2000000000};
+  const makeMint=(id,amount0,amount1)=>[
+    {address:pool.pool,...events.encodeEventLog(events.getEvent('Mint'),[pm,pm,42n,amount0,amount1])},
+    {address:pm,...iface.encodeEventLog(iface.getEvent('Transfer'),[ethers.ZeroAddress,wallet,id])}
+  ];
+  const receipt={status:1,hash:'0x'+'aa'.repeat(32),logs:[...makeMint(1n,50n*10n**18n,5n*10n**18n),...makeMint(2n,1005168935060106706n,2n*10n**18n)]};
+  const transaction={to:pm,from:wallet,data:iface.encodeFunctionData('mint',[params])};
+  a.context.positionFixture=position;a.context.poolFixture=pool;a.context.receiptFixture=receipt;a.context.transactionFixture=transaction;
+  const deposit=a.exec('extractPositionDeposit(positionFixture,poolFixture,receiptFixture,transactionFixture)');
+  assert.equal(deposit.amount0,1005168935060106706n);assert.equal(deposit.amount1,2n*10n**18n);assert.equal(deposit.max0,1000n*10n**18n);
+  // Actual inputs still survive when an aggregator prevents decoding direct input maximums.
+  a.context.transactionFixture={...transaction,to:pm,data:'0xdeadbeef'};
+  assert.equal(a.exec('extractPositionDeposit(positionFixture,poolFixture,receiptFixture,transactionFixture)').amount0,deposit.amount0);
+  a.context.transactionFixture=transaction;
+  a.context.fakePositionContract={interface:iface};
+  a.context.fakeProvider={async getBlockNumber(){return a.exec('POSITION_MANAGER_START_BLOCK')+1},async getLogs(){return[{address:pm,transactionHash:receipt.hash,...iface.encodeEventLog(iface.getEvent('Transfer'),[ethers.ZeroAddress,wallet,2n])}]},async getTransactionReceipt(){return receipt},async getTransaction(){return transaction}};
+  a.exec('contracts={PositionManager:fakePositionContract};provider=fakeProvider');
+  await a.exec('loadPositionDeposits([{p:positionFixture,pool:poolFixture}])');
+  assert.equal(a.exec("positionDeposits.get('2').amount0"),deposit.amount0);
+  a.exec("renderPositionAmounts($('positionList'),positionFixture,{symbol:'M_USDT',decimals:18},{symbol:'M_ETH',decimals:18},null,positionDeposits.get('2'),true)");
+  const rows=a.get('positionList').children[1].children[1].children;
+  assert.equal(rows[0].children[0].textContent,'最初实际投入');assert.match(rows[0].children[1].textContent,/1\.00516893/);
+  assert.equal(rows[1].children[1].textContent,'1,000');assert.match(rows[2].children[1].textContent,/998\.99483106/);
+});
+
+test('fresh and legacy DEX versions keep pools and position history separate while sharing issued tokens',async()=>{
+  const current=await app(),legacy=await app(new Map(),'?deployment=legacy');
+  assert.equal(current.exec('DEPLOYMENT_KEY'),'current');assert.equal(legacy.exec('DEPLOYMENT_KEY'),'legacy');
+  assert.notEqual(current.exec('ADDR.PoolManager'),legacy.exec('ADDR.PoolManager'));
+  assert.notEqual(current.exec('ADDR.PositionManager'),legacy.exec('ADDR.PositionManager'));
+  assert.equal(legacy.exec('ADDR.PositionManager'),'0x8201A0bB36E7c705431e4B859A12462a40ac6b8F');
+  assert.equal(legacy.exec('POSITION_MANAGER_START_BLOCK'),12011721);
+  assert.ok(current.exec('POSITION_MANAGER_START_BLOCK')>12011721);
+  assert.equal(current.exec('ADDR.TokenLauncher'),legacy.exec('ADDR.TokenLauncher'));
+  current.get('dexVersion').value='legacy';current.get('dexVersion').onchange();
+  assert.equal(new URL(current.context.redirect).searchParams.get('deployment'),'legacy');
+  legacy.get('dexVersion').value='current';legacy.get('dexVersion').onchange();
+  assert.equal(new URL(legacy.context.redirect).searchParams.has('deployment'),false);
+});
+
+test('market ratio conversion accounts for token order and decimal precision',async()=>{
+  const a=await app();
+  const ether="{address:'0xa317221F46598d8ce092FBd8153AF118abec4872',decimals:18}";
+  const usd="{address:'0x68Df69BC9EAEE428803B3aE0Aa00530aF19c4769',decimals:18}";
+  const sqrt=a.exec(`priceSqrtFromRatio(${ether},${usd},1n,200n)`);
+  assert.equal(sqrt,a.exec('isqrt((1n<<192n)/200n)'));
+  a.context.referenceFixture={sqrtPriceX96:sqrt};
+  assert.ok(Math.abs(a.exec(`Math.exp(marketHumanLog(referenceFixture,${ether},${usd}))`)-200)<1e-9);
+  assert.ok(Math.abs(a.exec(`Math.exp(marketHumanLog(referenceFixture,${usd},${ether}))`)-0.005)<1e-12);
+  // Same human ratio with a six-decimal stablecoin has a different raw sqrt price.
+  const usd6="{address:'0x68Df69BC9EAEE428803B3aE0Aa00530aF19c4769',decimals:6}";
+  const scaled=a.exec(`priceSqrtFromRatio(${ether},${usd6},1n,200n)`);assert.notEqual(scaled,sqrt);
+  a.context.referenceFixture={sqrtPriceX96:scaled};
+  assert.ok(Math.abs(a.exec(`Math.exp(marketHumanLog(referenceFixture,${ether},${usd6}))`)-200)<1e-9);
+});
+
+test('owner reference automatically fills creation and displays separately from swap execution',async()=>{
+  const a=await app(),owner='0x1111111111111111111111111111111111111111';let requested;
+  const price=a.exec('isqrt((1n<<192n)/200n)');
+  a.context.fakeMarket={async owner(){return owner},async getPrice(){return{sqrtPriceX96:price,version:4n,updatedAt:1000n}},async createPoolAtReference(...args){requested=args;return{hash:'0x'+'ab'.repeat(32),async wait(){return{status:1}}};}};
+  a.exec(`account='${owner}';contracts={MarketPriceRegistry:fakeMarket};
+    const mockA={address:'0xa317221F46598d8ce092FBd8153AF118abec4872',symbol:'M_ETH',decimals:18,chainId:11155111};
+    const mockB={address:'0x68Df69BC9EAEE428803B3aE0Aa00530aF19c4769',symbol:'M_USDT',decimals:18,chainId:11155111};
+    addCatalogToken(mockA,false);addCatalogToken(mockB,false);metadata.set(mockA.address.toLowerCase(),mockA);metadata.set(mockB.address.toLowerCase(),mockB);
+    setCreateToken('createA',mockA);setCreateToken('createB',mockB);chosenTokens[0]=mockA;chosenTokens[1]=mockB;`);
+  await a.exec('refreshMarketOwner()');await a.exec('refreshCreateMarketPrice(true)');
+  assert.equal(a.get('marketAdmin').hidden,false);assert.equal(a.get('initialPrice').value,'200');assert.equal(a.get('initialPrice').readOnly,true);
+  assert.equal(a.get('useMarketPrice').checked,true);
+  a.get('amountIn').value='2';await a.exec('refreshSwapMarketPrice()');
+  assert.match(a.get('swapMarketReference').children[0].textContent,/1 M_ETH ≈ 200 M_USDT/);
+  assert.match(a.get('swapMarketReference').children[1].textContent,/400 M_USDT/);
+  assert.match(a.get('swapMarketReference').children[2].textContent,/不保证按此成交/);
+  a.get('fee').value='3000';a.get('tickLower').value='-60000';a.get('tickUpper').value='-40000';
+  a.exec('refresh=async()=>{}');await a.exec('createPool()');
+  assert.equal(requested[5],4n);assert.equal(requested[2],3000);assert.equal(requested.length,6);
+  a.exec("account='0x2222222222222222222222222222222222222222'");await a.exec('refreshMarketOwner()');assert.equal(a.get('marketAdmin').hidden,true);
+});
+
+test('initial tick diagnostics explain the excluded 400-430 range and offer a valid reference-centered range',async()=>{
+  const a=await app(),math=require('../liquidity-math.js');
+  const {TickMath}=require('../../swap-contract/node_modules/@uniswap/v3-sdk');const JSBI=require('../../swap-contract/node_modules/jsbi');
+  for(const tick of [-887272,-60641,-59918,-52986,-46054,0,887271]){
+    const sqrt=math.sqrtAtTick(tick);assert.equal(math.tickAtSqrt(sqrt),TickMath.getTickAtSqrtRatio(JSBI.BigInt(String(sqrt))));
+  }
+  a.exec(`const exampleA={address:'0xa317221F46598d8ce092FBd8153AF118abec4872',symbol:'M_ETH',decimals:18,chainId:11155111};
+    const exampleB={address:'0x68Df69BC9EAEE428803B3aE0Aa00530aF19c4769',symbol:'M_USDT',decimals:18,chainId:11155111};
+    addCatalogToken(exampleA,false);addCatalogToken(exampleB,false);setCreateToken('createA',exampleA);setCreateToken('createB',exampleB);
+    createMarketReference={sqrtPriceX96:isqrt((1n<<192n)/200n),version:4n,key:marketPairKey(exampleA,exampleB)};`);
+  a.get('useMarketPrice').checked=true;a.get('tickLower').value='-60641';a.get('tickUpper').value='-59918';
+  a.exec('renderInitialTickInfo()');assert.match(a.get('initialTickInfo').textContent,/需满足 tickLower ≤ -52986 < tickUpper/);
+  a.get('fitInitialRange').onclick();
+  assert.ok(Number(a.get('tickLower').value)<=-52986);assert.ok(Number(a.get('tickUpper').value)>-52986);
+  assert.match(a.get('initialTickInfo').textContent,/已在当前区间内/);
+});
+
+test('unsettled position fees are separate from settled owed and included in the withdrawal estimate',async()=>{
+  const a=await app();
+  a.exec(`const feePosition={id:1n,liquidity:4828217995027465406356n,tokensOwed0:0n,tokensOwed1:0n,feeGrowthInside0LastX128:0n,feeGrowthInside1LastX128:0n};
+    const growth=(99n*10n**16n)*(1n<<128n)/feePosition.liquidity;
+    const pendingFees=estimatePositionFees(feePosition,0n,growth);
+    const feePoolFixture={tickLower:-100,tickUpper:100,sqrtPriceX96:1n<<96n};
+    const principalFixture=LiquidityPreviewMath.principal(feePoolFixture,feePosition.liquidity);
+    renderPositionAmounts($('positionList'),feePosition,{symbol:'M_USDT',decimals:18},{symbol:'M_ETH',decimals:18},feePoolFixture,null,true,pendingFees);`);
+  assert.equal(a.exec('pendingFees.amount0'),0n);
+  assert.ok(a.exec('pendingFees.amount1')>98n*10n**16n);
+  assert.ok(a.exec('pendingFees.amount1')<10n**18n);
+  const rows=a.get('positionList').children[1].children[1].children;
+  const pending=rows.find(r=>r.children[0].textContent==='未结算手续费估算');
+  const settled=rows.find(r=>r.children[0].textContent==='已结算待领取（本金＋费用）');
+  const total=rows.find(r=>r.children[0].textContent==='预计移除后可领取合计');
+  assert.match(pending.children[2].textContent,/0\.98999999/);
+  assert.equal(settled.children[2].textContent,'0');
+  assert.equal(total.children[2].title,ethers.formatUnits(a.exec('principalFixture.amount1+pendingFees.amount1'),18)+' M_ETH');
 });
